@@ -7,7 +7,9 @@ from pathlib import Path
 import torch
 
 _LOCAL_VLLM_REPO = Path(__file__).resolve().parent
-if os.environ.get("VLLM_REPRO_USE_INSTALLED") != "1" and (_LOCAL_VLLM_REPO / "vllm").is_dir():
+if os.environ.get("VLLM_REPRO_USE_INSTALLED") == "1":
+    sys.path = [p for p in sys.path if Path(p or ".").resolve() != _LOCAL_VLLM_REPO]
+elif (_LOCAL_VLLM_REPO / "vllm").is_dir():
     sys.path.insert(0, str(_LOCAL_VLLM_REPO))
 
 
