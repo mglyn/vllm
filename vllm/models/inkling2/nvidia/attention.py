@@ -340,16 +340,31 @@ class Inkling2Attention(nn.Module, AttentionLayerBase):
             return list(projected.split(self.split_sizes, dim=-1)[:6])
         q_side, kv_size = sum(self.split_sizes[:4]), self.split_sizes[4]
         k_end = q_side + kv_size
-        if use_qkv_bmm(x_q, x_k, x_v, weight):
-            projected = qkv_bmm(x_q, x_k, x_v, weight, q_side, k_end)
+        grouped = use_qkv_bmm(x_q, x_k, x_v, weight)
+        sm80 = grouped and current_platform.is_device_capability(
+            80, device_id=x_q.get_device()
+        )
+        # Keep the SM80 cuBLAS query reduction for the Mini TP2 shape where
+        # it uses BF16 split-K partials. The K/V projections can still share a launch.
+        keep_query = sm80 and weight.shape[0] == 4304 and 4 <= x_q.shape[0] <= 7
+        if grouped and not keep_query:
+            projected = qkv_bmm(
+                x_q, x_k, x_v, weight, q_side, k_end, enable_pdl=not sm80
+            )
             splits = projected.split(self.split_sizes, dim=-1)
             add_linear_lora(self.qkvr, projected, x_q, range(4))
             add_linear_lora(self.qkvr, splits[4], x_k, [4])
             add_linear_lora(self.qkvr, splits[5], x_v, [5])
             return list(splits[:6])
         projected = linear(x_q, weight[: sum(self.q_side_splits)])
-        k = linear(x_k, weight[q_side:k_end])
-        v = linear(x_v, weight[k_end : k_end + kv_size])
+        if keep_query:
+            kv_weight = weight[q_side : k_end + kv_size]
+            k, v = qkv_bmm(
+                x_k, x_k, x_v, kv_weight, 0, kv_size, enable_pdl=False
+            ).split(kv_size, dim=-1)
+        else:
+            k = linear(x_k, weight[q_side:k_end])
+            v = linear(x_v, weight[k_end : k_end + kv_size])
         add_linear_lora(self.qkvr, projected, x_q, range(4))
         add_linear_lora(self.qkvr, k, x_k, [4])
         add_linear_lora(self.qkvr, v, x_v, [5])
