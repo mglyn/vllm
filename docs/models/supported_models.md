@@ -703,11 +703,6 @@ Some models are supported only via the [Transformers modeling backend](#transfor
 <sup>Q</sup> `Qwen*-VL` officially uses `qwen_vl_utils` for image preprocessing, while vLLM uses `transformers`' `video_processing_qwen*`, which leads to slightly different results compared to the official Hugging Face repository examples.
 
 !!! note
-    On A100 (SM80), Qwen Gated DeltaNet (GDN) prefill uses Triton by default.
-    Use `--gdn-prefill-backend flashinfer` to select FlashInfer for FP16 or BF16
-    inputs when the key and value head dimensions are both 128.
-
-!!! note
     `Alpamayo2Super` serves the reasoning model of `nvidia/Alpamayo2-Super`: visual
     question answering, grounding, chain-of-causation reasoning with meta-actions, and
     auto-labeling. The trajectory expert is not loaded, so trajectories are not produced.
