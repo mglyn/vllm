@@ -13,6 +13,7 @@ returned as is (fp32) without a norm weight.
 import torch
 
 from vllm.models.inkling2.nvidia.ops.norm import rsqrt
+from vllm.platforms import current_platform
 from vllm.triton_utils import tl, tldevice, triton
 
 
@@ -73,8 +74,10 @@ def _attn_res_kernel(
     APPLY_NORM: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_D: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
 ):
-    tl.extra.cuda.gdc_wait()
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
     # One program per (token, query).
     t = tl.program_id(1).to(tl.int64)
     q_off = tl.program_id(0) * D
@@ -168,6 +171,22 @@ def _attn_res_kernel(
 
 
 @triton.jit
+def _add_four_score_pairs(
+    s0, d0, s1, d1, s2, d2, s3, d3, t0, e0, t1, e1, t2, e2, t3, e3
+):
+    return (s0 + t0, d0 + e0, s1 + t1, d1 + e1, s2 + t2, d2 + e2, s3 + t3, d3 + e3)
+
+
+@triton.jit
+def _four_score_pairs(src, channels, mask, query, HAS_ADDEND: tl.constexpr):
+    values = ()
+    for n in tl.static_range(4):
+        x = _load_source(*src, channels, mask, n, 3, HAS_ADDEND)
+        values += (x * x, query * x)  # type: ignore[assignment]
+    return tl.reduce(values, 0, _add_four_score_pairs)
+
+
+@triton.jit
 def _attn_res_row_kernel(
     Stack,
     Last,
@@ -187,8 +206,11 @@ def _attn_res_row_kernel(
     BLOCK_N: tl.constexpr,
     BLOCK_A: tl.constexpr,
     BLOCK_B: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
+    PARALLEL_SCORES: tl.constexpr = False,
 ):
-    tl.extra.cuda.gdc_wait()
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
     # Small batches: one program per (token, query) holds the row in registers
     # as a power-of-2 head [0, BLOCK_A) and a masked tail [BLOCK_A, D), so the
     # sources are read twice instead of three times.
@@ -206,12 +228,23 @@ def _attn_res_row_kernel(
 
     logits = tl.full((BLOCK_N,), float("-inf"), tl.float32)
     inv_rms = tl.zeros((BLOCK_N,), tl.float32)
+    if PARALLEL_SCORES:
+        tl.static_assert(N_STACK == 3)
+        # Share the cross-warp reductions across all sources and both
+        # statistics. Each statistic retains its original reduction tree.
+        scores_a = _four_score_pairs(src, da, mask_a, qa, HAS_ADDEND)
+        scores_b = _four_score_pairs(src, db, mask_b, qb, HAS_ADDEND)
     for n in tl.static_range(N_STACK + 1):
-        xa = _load_source(*src, da, mask_a, n, N_STACK, HAS_ADDEND)
-        xb = _load_source(*src, db, mask_b, n, N_STACK, HAS_ADDEND)
-        rstd = rsqrt(tl.fma(tl.sum(xa * xa) + tl.sum(xb * xb), 1.0 / D, eps))
+        if PARALLEL_SCORES:
+            sum_sq = scores_a[2 * n] + scores_b[2 * n]
+            dot = scores_a[2 * n + 1] + scores_b[2 * n + 1]
+        else:
+            xa = _load_source(*src, da, mask_a, n, N_STACK, HAS_ADDEND)
+            xb = _load_source(*src, db, mask_b, n, N_STACK, HAS_ADDEND)
+            sum_sq = tl.sum(xa * xa) + tl.sum(xb * xb)
+            dot = tl.sum(qa * xa) + tl.sum(qb * xb)
+        rstd = rsqrt(tl.fma(sum_sq, 1.0 / D, eps))
         inv_rms = tl.where(n_idx == n, rstd, inv_rms)
-        dot = tl.sum(qa * xa) + tl.sum(qb * xb)
         logits = tl.where(n_idx == n, dot * rstd, logits)
 
     probs = tldevice.exp(logits - tl.max(logits))
@@ -271,6 +304,7 @@ def attn_res(
     assert norm_weight.shape == queries.shape and norm_weight.is_contiguous()
     out_dtype = last.dtype if apply_norm else torch.float32
     out = torch.empty((num_q, num_tokens, d), dtype=out_dtype, device=last.device)
+    enable_pdl = current_platform.has_device_capability(90, device_id=last.get_device())
     args = (
         stack,
         last,
@@ -291,15 +325,31 @@ def attn_res(
         APPLY_NORM=apply_norm,
         BLOCK_N=triton.next_power_of_2(num_stack + 1),
         enable_fp_fusion=False,
-        launch_pdl=True,
+        ENABLE_PDL=enable_pdl,
+        launch_pdl=enable_pdl,
     )
     # The queries of a token run back to back and share its sources in L2.
     grid = (num_q, num_tokens)
     if num_tokens * num_q <= 256:
         block_a = triton.next_power_of_2(d + 1) // 2
         block_b = max(triton.next_power_of_2(d - block_a), 16)
+        parallel_scores = (
+            0 < num_tokens <= 32
+            and d == 2304
+            and num_stack == 3
+            and num_q in (1, 3)
+            and normalize_values
+            and apply_norm
+            and stack.dtype == last.dtype == torch.bfloat16
+            and last.is_cuda
+        )
         _attn_res_row_kernel[grid](
-            *args, **meta, BLOCK_A=block_a, BLOCK_B=block_b, num_warps=8
+            *args,
+            **meta,
+            BLOCK_A=block_a,
+            BLOCK_B=block_b,
+            PARALLEL_SCORES=parallel_scores,
+            num_warps=8,
         )
     else:
         _attn_res_kernel[grid](*args, **meta, BLOCK_D=1024, num_warps=4)

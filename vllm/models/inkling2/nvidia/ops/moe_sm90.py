@@ -21,7 +21,7 @@ from vllm.triton_utils import tl, triton
 
 from .activation import _situ
 from .linear import k_group_partials
-from .moe import _load_bias, _local_experts, _select_experts
+from .moe import _load_bias, _local_experts, _maximum, _select_experts
 
 if TYPE_CHECKING:
     from vllm.utils.humming import HummingInputSchema
@@ -155,6 +155,86 @@ def swiglu(
         num_warps=2,
     )
     return out
+
+
+@triton.jit
+def _align_small_routing(
+    Ids,
+    SortedIds,
+    ExpertIds,
+    TotalPadded,
+    SLOTS: tl.constexpr,
+    EXPERTS: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_SLOTS: tl.constexpr,
+):
+    pos = tl.arange(0, BLOCK_SLOTS)
+    ids = tl.load(Ids + pos, pos < SLOTS, -1)
+    ids = tl.where((ids >= 0) & (ids < EXPERTS), ids, EXPERTS)
+    key = tl.sort(ids * BLOCK_SLOTS + pos, descending=False)
+    expert = key // BLOCK_SLOTS
+    valid = expert < EXPERTS
+    prev = tl.gather(expert, tl.maximum(pos - 1, 0), axis=0)
+    next_expert = tl.gather(expert, tl.minimum(pos + 1, BLOCK_SLOTS - 1), axis=0)
+    first = valid & ((pos == 0) | (prev != expert))
+    last = valid & ((pos == BLOCK_SLOTS - 1) | (next_expert != expert))
+    blocks = tl.cumsum(first.to(tl.int32), 0) - 1
+    start = tl.associative_scan(tl.where(first, pos, 0), 0, _maximum)
+    slot = pos - start
+    count = tl.sum(first.to(tl.int32), 0)
+
+    tl.store(TotalPadded, count * BLOCK_M)
+    tl.store(ExpertIds + blocks, expert, first)
+    tl.store(ExpertIds + pos, -1, (pos < SLOTS) & (pos >= count))
+    tl.store(SortedIds + blocks * BLOCK_M + slot, key % BLOCK_SLOTS, valid)
+    pad = tl.arange(0, BLOCK_M)
+    tl.store(
+        SortedIds + blocks[:, None] * BLOCK_M + pad[None, :],
+        SLOTS,
+        last[:, None] & (pad[None, :] > slot[:, None]),
+    )
+    remaining = tl.arange(0, BLOCK_SLOTS * BLOCK_M)
+    tl.store(
+        SortedIds + remaining,
+        SLOTS,
+        (remaining >= count * BLOCK_M) & (remaining < SLOTS * BLOCK_M),
+    )
+
+
+def _align_indexed_experts(
+    ids: torch.Tensor, block_size: int, num_experts: int
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    tokens, topk = ids.shape
+    # select_experts returns distinct experts per token, so each expert fits
+    # into one block when the number of tokens is at most the block size.
+    if (
+        0 < tokens <= block_size == 8
+        and topk == 8
+        and num_experts in (64, 128)
+        and ids.dtype == torch.int32
+        and ids.is_contiguous()
+        and ids.is_cuda
+        and not envs.VLLM_BATCH_INVARIANT
+    ):
+        slots = tokens * topk
+        sorted_ids = ids.new_empty((slots * block_size,))
+        expert_ids = ids.new_empty((slots,))
+        total_padded = ids.new_empty((1,))
+        _align_small_routing[(1,)](
+            ids,
+            sorted_ids,
+            expert_ids,
+            total_padded,
+            slots,
+            num_experts,
+            block_size,
+            triton.next_power_of_2(slots),
+            num_warps=1,
+        )
+        return sorted_ids, expert_ids, total_padded
+    return moe_align_block_size(
+        ids, block_size, num_experts, ignore_invalid_experts=True
+    )
 
 
 class HummingExperts:
@@ -301,9 +381,7 @@ class HummingExperts:
         valid_rows = -(-rows * self.num_experts // num_global_experts)
         block_m = {name: self._block_m(name, valid_rows) for name in ("w13", "w2")}
         alignments = {
-            size: moe_align_block_size(
-                ids, size, self.num_experts, ignore_invalid_experts=True
-            )[:3]
+            size: _align_indexed_experts(ids, size, self.num_experts)
             for size in set(block_m.values())
         }
         gate_up = self._gemm(
