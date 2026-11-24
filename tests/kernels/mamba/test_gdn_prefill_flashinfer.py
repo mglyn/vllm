@@ -68,14 +68,18 @@ def test_flashinfer_gdn_prefill_passes_cu_seqlens_through(monkeypatch):
 
 @pytest.mark.skipif(not current_platform.is_cuda(), reason="CUDA backend selection")
 @pytest.mark.parametrize(
-    ("requested", "value_dim", "expected"),
+    ("requested", "dtype", "value_dim", "expected"),
     [
-        ("auto", 128, "triton"),
-        ("flashinfer", 128, "flashinfer"),
-        ("flashinfer", 64, "triton"),
+        ("auto", torch.bfloat16, 128, "triton"),
+        ("flashinfer", torch.bfloat16, 128, "flashinfer"),
+        ("flashinfer", torch.float16, 128, "flashinfer"),
+        ("flashinfer", torch.float32, 128, "triton"),
+        ("flashinfer", torch.bfloat16, 64, "triton"),
     ],
 )
-def test_sm80_flashinfer_prefill_is_opt_in(monkeypatch, requested, value_dim, expected):
+def test_sm80_flashinfer_prefill_is_opt_in(
+    monkeypatch, requested, dtype, value_dim, expected
+):
     from vllm.platforms.interface import DeviceCapability
 
     monkeypatch.setattr(
@@ -86,9 +90,10 @@ def test_sm80_flashinfer_prefill_is_opt_in(monkeypatch, requested, value_dim, ex
     config = SimpleNamespace(
         additional_config={"gdn_prefill_backend": requested},
         model_config=SimpleNamespace(
+            dtype=dtype,
             hf_text_config=SimpleNamespace(
                 linear_key_head_dim=128, linear_value_head_dim=value_dim
-            )
+            ),
         ),
     )
     assert _resolve_gdn_prefill_backend(config)[1] == expected

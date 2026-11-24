@@ -211,7 +211,7 @@ def _resolve_gdn_prefill_backend(
     * `platform == cuda`;
     * `head_k_dim == head_v_dim == 128`;
     * one of the following:
-      - Ampere (SM80) with an explicit FlashInfer request;
+      - Ampere (SM80) with an explicit FlashInfer request and FP16/BF16 inputs;
       - Hopper (SM90);
       - Blackwell (SM10.x) with `head_k_dim == 128`, `cuda_runtime >= 13`;
       - Blackwell (SM12.x) with `head_k_dim == 128`, `cuda_runtime >= 13`.
@@ -337,7 +337,9 @@ def _resolve_gdn_prefill_backend(
     supports_cutedsl = False
 
     if current_platform.is_device_capability(90) or (
-        backend == "flashinfer" and current_platform.is_device_capability(80)
+        backend == "flashinfer"
+        and current_platform.is_device_capability(80)
+        and vllm_config.model_config.dtype in (torch.float16, torch.bfloat16)
     ):
         supports_flashinfer = head_k_dim == head_v_dim == 128
     elif (
