@@ -25,6 +25,7 @@ RMS-normalizes V per head and writes both to the paged KV cache.
 import torch
 
 from vllm.models.inkling2.nvidia.ops.norm import qr_clip_rel_tokens, rsqrt
+from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 
 from . import use_pdl
@@ -390,6 +391,117 @@ def _sconv_kernel(
     tl.store(out_ptr + offs, y, mask=mask)
 
 
+@triton.jit
+def _split_four_taps(values, BLOCK_C: tl.constexpr):
+    # The transpose puts the four taps of each channel in the trailing axis.
+    even, odd = tl.split(tl.reshape(tl.trans(values), (BLOCK_C, 2, 2)))
+    a, c = tl.split(even)
+    b, d = tl.split(odd)
+    return a, b, c, d
+
+
+@triton.jit
+def _sconv_sm80_kernel(
+    X,
+    Cache,
+    Weight,
+    Out,
+    Residual,
+    Addend,
+    Position,
+    SeqIdx,
+    Slots,
+    BlockTable,
+    QueryStart,
+    stride_x,
+    stride_block,
+    stride_head,
+    stride_position,
+    stride_weight_c,
+    stride_weight_k,
+    stride_table,
+    max_blocks,
+    scale,
+    C: tl.constexpr,
+    PAGE: tl.constexpr,
+    OFFSET: tl.constexpr,
+    WIDTH: tl.constexpr,
+    HAS_RESIDUAL: tl.constexpr,
+    HAS_ADDEND: tl.constexpr,
+    BLOCK_C: tl.constexpr,
+):
+    token = tl.program_id(0).to(tl.int64)
+    cols = tl.program_id(1) * BLOCK_C + tl.arange(0, BLOCK_C)
+    col_mask = cols < C
+    pos = tl.load(Position + token)
+    req = tl.load(SeqIdx + token)
+    slot = tl.load(Slots + token)
+    start = tl.load(QueryStart + token)
+    cache_cols = cols // WIDTH * stride_head + OFFSET + cols % WIDTH
+
+    # Resolve the four taps together so their loads can overlap. Preserve
+    # the reference FP32 FMA order and both BF16 rounding points.
+    tap = tl.arange(0, 4)
+    lag = 3 - tap
+    source = pos - lag
+    row = token - lag
+    valid = (slot >= 0) & (source >= 0)
+    intra = valid & (row >= start)
+    cached = valid & (row < start)
+    live = tl.load(
+        X + tl.maximum(row, 0)[:, None] * stride_x + cols[None, :],
+        intra[:, None] & col_mask[None, :],
+        0,
+    ).to(tl.float32)
+    history = _cached_taps(
+        Cache,
+        cache_cols,
+        stride_block,
+        stride_position,
+        PAGE,
+        col_mask,
+        BlockTable,
+        stride_table,
+        max_blocks,
+        req,
+        source,
+        cached,
+    )
+    weight = (
+        tl.load(
+            Weight + tap[:, None] * stride_weight_k + cols[None, :] * stride_weight_c,
+            col_mask[None, :],
+            0,
+        )
+        .to(Cache.dtype.element_ty)
+        .to(tl.float32)
+    )
+    x0, x1, x2, x3 = _split_four_taps(live + history, BLOCK_C)
+    w0, w1, w2, w3 = _split_four_taps(weight, BLOCK_C)
+    value = tl.fma(x0, w0, 0.0)
+    value = tl.fma(x1, w1, value)
+    value = tl.fma(x2, w2, value)
+    value = tl.fma(x3, w3, value)
+
+    cur = tl.load(X + token * stride_x + cols, col_mask, 0)
+    safe_slot = tl.maximum(slot, 0)
+    cache_dst = (
+        Cache
+        + (safe_slot // PAGE) * stride_block
+        + (safe_slot % PAGE) * stride_position
+        + cache_cols
+    )
+    tl.store(cache_dst, cur, col_mask & (slot >= 0))
+    value = ((value + cur.to(tl.float32)) * scale).to(Out.dtype.element_ty)
+    out_pos = token * C + cols
+    if HAS_ADDEND:
+        acc = tl.load(Addend + out_pos, col_mask, 0).to(tl.float32)
+        if HAS_RESIDUAL:
+            acc = tl.load(Residual + out_pos, col_mask, 0).to(tl.float32) + acc
+        value = (acc + value.to(tl.float32)).to(Out.dtype.element_ty)
+    tl.store(Out + out_pos, value, col_mask)
+
+
 def short_conv(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -421,6 +533,46 @@ def short_conv(
     num_heads = cache.shape[1]
     assert channels == num_heads * stream_width
     width = weight.shape[1]
+    if (
+        0 < num_tokens <= 8
+        and channels == 2304
+        and num_heads in (4, 8)
+        and width == 4
+        and x.dtype == cache.dtype == out.dtype == torch.bfloat16
+        and x.is_cuda
+        and current_platform.is_device_capability(80, device_id=x.get_device())
+    ):
+        block_c = 256
+        _sconv_sm80_kernel[(num_tokens, triton.cdiv(channels, block_c))](
+            x,
+            cache,
+            weight,
+            out,
+            residual,
+            addend,
+            positions,
+            seq_idx,
+            slot_mapping,
+            block_table,
+            query_start,
+            x.stride(0),
+            *cache.stride()[:3],
+            weight.stride(0),
+            weight.stride(1),
+            block_table.stride(0),
+            block_table.shape[1],
+            5**-0.5,
+            C=channels,
+            PAGE=cache.shape[2],
+            OFFSET=stream_offset,
+            WIDTH=stream_width,
+            HAS_RESIDUAL=residual is not None,
+            HAS_ADDEND=addend is not None,
+            BLOCK_C=block_c,
+            num_warps=2,
+            enable_fp_fusion=False,
+        )
+        return out
     # Prefill tiles skip the cache reads they never need.
     prefill = num_tokens > 256
     if num_tokens <= 8:

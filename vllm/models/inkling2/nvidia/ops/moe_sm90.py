@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Inkling2 routed experts on Hopper: Humming expert GEMMs (bf16
-activations, NVFP4 / MXFP8 weights) in place of the TRT-LLM-gen ones.
+"""Inkling2 routed experts using Humming GEMMs with BF16 activations and
+NVFP4 or MXFP8 weights.
 
 Rows stay in the flat (token * topk + slot) order: the gate/up GEMM
 gathers each row's token, the down GEMM reads and writes row by row, and
@@ -22,6 +22,7 @@ from vllm.triton_utils import tl, triton
 from .activation import _situ
 from .linear import k_group_partials
 from .moe import _load_bias, _local_experts, _select_experts
+from .sm80 import humming_decode_tuning
 
 if TYPE_CHECKING:
     from vllm.utils.humming import HummingInputSchema
@@ -190,6 +191,7 @@ class HummingExperts:
         self.tensors: dict[str, dict[str, torch.Tensor]] = {}
         self.tunings: dict[str, list] = {}
         self.tuning_strs: dict[str, str] = {}
+        self.sm80_decode_tuning: dict[tuple[str, int], str] = {}
         for name, (n, k) in zip(("w13", "w2"), shapes):
             weight, scale, global_scale = weights[name]
             num_experts = weight.shape[0]
@@ -233,6 +235,10 @@ class HummingExperts:
             self.tensors[name] = tensors
             self.tunings[name] = tuning
             self.tuning_strs[name] = json.dumps(tuning)
+            for rows, schedule in humming_decode_tuning(
+                weight, shapes, nvfp4, input_schema is None, tuning
+            ).items():
+                self.sm80_decode_tuning[name, rows] = schedule
         self.num_experts = num_experts
         self.compute_config = json.dumps(
             {
@@ -257,6 +263,7 @@ class HummingExperts:
         alignment: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
         top_k: int,
         valid_rows: int,
+        tuning_config: str | None = None,
     ) -> torch.Tensor:
         from vllm.utils.humming import humming_forward
 
@@ -280,7 +287,7 @@ class HummingExperts:
             top_k=top_k,
             valid_shape_m=valid_rows,
             compute_config=self.compute_config,
-            tuning_config=self.tuning_strs[name],
+            tuning_config=tuning_config or self.tuning_strs[name],
         )
 
     def __call__(
@@ -299,6 +306,9 @@ class HummingExperts:
         rows = tokens * topk
         # Expected local rows, which pick the kernel configs.
         valid_rows = -(-rows * self.num_experts // num_global_experts)
+        tuned = (
+            self.sm80_decode_tuning if num_global_experts == 128 and topk == 8 else {}
+        )
         block_m = {name: self._block_m(name, valid_rows) for name in ("w13", "w2")}
         alignments = {
             size: moe_align_block_size(
@@ -307,10 +317,22 @@ class HummingExperts:
             for size in set(block_m.values())
         }
         gate_up = self._gemm(
-            "w13", x, rows, alignments[block_m["w13"]], topk, valid_rows
+            "w13",
+            x,
+            rows,
+            alignments[block_m["w13"]],
+            topk,
+            valid_rows,
+            tuned.get(("w13", valid_rows)),
         )
         activated = swiglu(gate_up, weights, src2dst, gate_cap, up_cap)
         del gate_up
         return self._gemm(
-            "w2", activated, rows, alignments[block_m["w2"]], 1, valid_rows
+            "w2",
+            activated,
+            rows,
+            alignments[block_m["w2"]],
+            1,
+            valid_rows,
+            tuned.get(("w2", valid_rows)),
         )

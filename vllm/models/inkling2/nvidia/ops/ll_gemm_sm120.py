@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Low-M BF16 tensor-core projections for SM120/SM121: batched `x @ w.T` with
-deterministic split-K for narrow outputs, and a grouped q/k/v projection."""
+"""Low-M BF16 tensor-core projections for Inkling 2.
+
+The deterministic split-K kernel also serves the SM80 loop down projection.
+"""
 
 import functools
 from typing import NamedTuple
@@ -40,12 +42,14 @@ def _ll_gemm_kernel(
     K_PER_SPLIT: tl.constexpr,
     SPLIT: tl.constexpr,
     MP: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
 ):
     """Program `(n, b, s)` computes column tile `n` of batch `b` over K range
     `s`. With `SPLIT > 1` it writes fp32 partials to `P` `[SPLIT, B, MP, N]`;
     the last of the tile's programs to finish (counted in `C`, reset to 0
     after) sums them in split order, so results are deterministic."""
-    tl.extra.cuda.gdc_wait()
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
     pid_n = tl.program_id(0)
     b = tl.program_id(1)
     s = tl.program_id(2)
@@ -90,7 +94,8 @@ def _ll_gemm_kernel(
             acc.to(Y.dtype.element_ty),
             (rows[:, None] < M) & (cols[None, :] < N),
         )
-    tl.extra.cuda.gdc_launch_dependents()
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
 
 
 @triton.jit
@@ -196,7 +201,12 @@ def _counter(stream: int) -> torch.Tensor:
 
 
 def _ll_gemm(
-    x: torch.Tensor, w: torch.Tensor, bias: torch.Tensor | None, out: torch.Tensor
+    x: torch.Tensor,
+    w: torch.Tensor,
+    bias: torch.Tensor | None,
+    out: torch.Tensor,
+    *,
+    enable_pdl: bool = True,
 ) -> None:
     nb, m, k = x.shape
     n = w.shape[1]
@@ -235,9 +245,10 @@ def _ll_gemm(
         K_PER_SPLIT=cfg.k_per_split,
         SPLIT=cfg.split,
         MP=_MP,
+        ENABLE_PDL=enable_pdl,
         num_warps=cfg.num_warps,
         num_stages=cfg.num_stages,
-        launch_pdl=True,
+        launch_pdl=enable_pdl,
     )
 
 
