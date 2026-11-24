@@ -180,7 +180,7 @@ def _four_score_pairs(src, channels, mask, query, HAS_ADDEND: tl.constexpr):
     values = ()
     for n in tl.static_range(4):
         x = _load_source(*src, channels, mask, n, 3, HAS_ADDEND)
-        values += (x * x, query * x)
+        values += (x * x, query * x)  # type: ignore[assignment]
     return tl.reduce(values, 0, _add_four_score_pairs)
 
 
