@@ -8,15 +8,10 @@ from typing import Any
 import torch
 
 from vllm import envs
-from vllm.model_executor.layers.fused_moe.moe_align_block_size import (
-    moe_align_block_size,
-)
 from vllm.platforms import current_platform
-from vllm.triton_utils import tl, triton
 from vllm.utils.platform_utils import get_device_name_as_file_name, num_compute_units
 
 from .ll_gemm_sm120 import MAX_M, _ll_gemm
-from .moe import _maximum
 
 
 def _is_full_a100_pcie(device_id: int) -> bool:
@@ -41,18 +36,6 @@ def sm80_bf16_loop_down(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     return out
 
 
-def use_grouped_qkv(
-    x_q: torch.Tensor, x_k: torch.Tensor, x_v: torch.Tensor, w: torch.Tensor
-) -> bool:
-    return (
-        w.shape in ((8600, 2304), (4304, 2304))
-        and x_q.shape[1] == w.shape[1]
-        and x_q.device == x_k.device == x_v.device == w.device
-        and not envs.VLLM_BATCH_INVARIANT
-        and current_platform.is_device_capability(80, device_id=x_q.get_device())
-    )
-
-
 def use_three_stage_attention(
     q: torch.Tensor,
     key_cache: torch.Tensor,
@@ -73,87 +56,6 @@ def use_three_stage_attention(
         and page == 64
         and q.dtype == key_cache.dtype == value_cache.dtype == torch.bfloat16
         and _is_full_a100_pcie(q.get_device())
-    )
-
-
-@triton.jit
-def _align_small_routing(
-    Ids,
-    SortedIds,
-    ExpertIds,
-    TotalPadded,
-    SLOTS: tl.constexpr,
-    EXPERTS: tl.constexpr,
-    BLOCK_M: tl.constexpr,
-    BLOCK_SLOTS: tl.constexpr,
-):
-    pos = tl.arange(0, BLOCK_SLOTS)
-    ids = tl.load(Ids + pos, pos < SLOTS, -1)
-    ids = tl.where((ids >= 0) & (ids < EXPERTS), ids, EXPERTS)
-    key = tl.sort(ids * BLOCK_SLOTS + pos, descending=False)
-    expert = key // BLOCK_SLOTS
-    valid = expert < EXPERTS
-    prev = tl.gather(expert, tl.maximum(pos - 1, 0), axis=0)
-    next_expert = tl.gather(expert, tl.minimum(pos + 1, BLOCK_SLOTS - 1), axis=0)
-    first = valid & ((pos == 0) | (prev != expert))
-    last = valid & ((pos == BLOCK_SLOTS - 1) | (next_expert != expert))
-    blocks = tl.cumsum(first.to(tl.int32), 0) - 1
-    start = tl.associative_scan(tl.where(first, pos, 0), 0, _maximum)
-    slot = pos - start
-    count = tl.sum(first.to(tl.int32), 0)
-
-    tl.store(TotalPadded, count * BLOCK_M)
-    tl.store(ExpertIds + blocks, expert, first)
-    tl.store(ExpertIds + pos, -1, (pos < SLOTS) & (pos >= count))
-    tl.store(SortedIds + blocks * BLOCK_M + slot, key % BLOCK_SLOTS, valid)
-    pad = tl.arange(0, BLOCK_M)
-    tl.store(
-        SortedIds + blocks[:, None] * BLOCK_M + pad[None, :],
-        SLOTS,
-        last[:, None] & (pad[None, :] > slot[:, None]),
-    )
-    remaining = tl.arange(0, BLOCK_SLOTS * BLOCK_M)
-    tl.store(
-        SortedIds + remaining,
-        SLOTS,
-        (remaining >= count * BLOCK_M) & (remaining < SLOTS * BLOCK_M),
-    )
-
-
-def _align_indexed_experts(
-    ids: torch.Tensor, block_size: int, num_experts: int
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    tokens, topk = ids.shape
-    # select_experts returns distinct experts per token, so each expert fits
-    # into one block when the number of tokens is at most the block size.
-    if (
-        0 < tokens <= block_size == 8
-        and topk == 8
-        and num_experts in (64, 128)
-        and ids.dtype == torch.int32
-        and ids.is_contiguous()
-        and ids.is_cuda
-        and current_platform.is_device_capability(80, device_id=ids.get_device())
-        and not envs.VLLM_BATCH_INVARIANT
-    ):
-        slots = tokens * topk
-        sorted_ids = ids.new_empty((slots * block_size,))
-        expert_ids = ids.new_empty((slots,))
-        total_padded = ids.new_empty((1,))
-        _align_small_routing[(1,)](
-            ids,
-            sorted_ids,
-            expert_ids,
-            total_padded,
-            slots,
-            num_experts,
-            block_size,
-            triton.next_power_of_2(slots),
-            num_warps=1,
-        )
-        return sorted_ids, expert_ids, total_padded
-    return moe_align_block_size(
-        ids, block_size, num_experts, ignore_invalid_experts=True
     )
 
 

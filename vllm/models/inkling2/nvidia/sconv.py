@@ -13,7 +13,6 @@ from typing import cast
 import torch
 from torch import nn
 
-from vllm import envs
 from vllm.distributed import get_tensor_model_parallel_rank
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.utils import set_weight_attrs
@@ -21,8 +20,6 @@ from vllm.models.inkling.nvidia.sconv_swa_attn import (
     InklingConvState,
     InklingSconvMetadata,
 )
-from vllm.platforms import current_platform
-from vllm.triton_utils import tl, triton
 
 from .ops.allreduce import Inkling2AllReduceWorkspace, all_reduce_conv_mix
 from .ops.conv_mix import conv_mix as fused_conv_mix
@@ -32,24 +29,6 @@ from .ops.sconv import short_conv
 from .ops.seq_parallel import SeqParallel
 
 K_STREAM, V_STREAM, ATTN_STREAM, MLP_STREAM = range(4)
-
-
-@triton.jit
-def _sm80_dynamic_taps(
-    X,
-    Weight,
-    Out,
-    INPUT_STRIDE: tl.constexpr,
-    IN_FEATURES: tl.constexpr,
-    OUT_FEATURES: tl.constexpr,
-    BLOCK_K: tl.constexpr,
-):
-    # One CTA reduces a tap in FP32 and writes its final BF16 value.
-    token, tap = tl.program_id(0), tl.program_id(1)
-    k = tl.arange(0, BLOCK_K)
-    x = tl.load(X + token * INPUT_STRIDE + k, k < IN_FEATURES, 0).to(tl.float32)
-    w = tl.load(Weight + tap * IN_FEATURES + k, k < IN_FEATURES, 0).to(tl.float32)
-    tl.store(Out + token * OUT_FEATURES + tap, tl.sum(x * w, axis=0))
 
 
 def conv_metadata(owner: InklingConvState) -> InklingSconvMetadata | None:
@@ -128,33 +107,6 @@ class Inkling2ShortConv(nn.Module):
             return linear_k_groups(x.contiguous(), self.weight_proj, x.dtype)
         if use_sm12x_bf16_ll_gemm(x, self.weight_proj):
             return sm12x_bf16_ll_gemm(x, self.weight_proj)
-        if (
-            x.ndim == 2
-            and 0 < x.shape[0] <= 16
-            and x.shape[1] == 2304
-            and x.dtype == self.weight_proj.dtype == torch.bfloat16
-            and x.stride(1) == 1
-            and self.weight_proj.shape in ((16, 2304), (32, 2304))
-            and self.weight_proj.is_contiguous()
-            and x.is_cuda
-            and x.device == self.weight_proj.device
-            and current_platform.is_device_capability(80, device_id=x.get_device())
-            and not envs.VLLM_BATCH_INVARIANT
-        ):
-            tokens, in_features = x.shape
-            out_features = self.weight_proj.shape[0]
-            out = x.new_empty((tokens, out_features))
-            _sm80_dynamic_taps[(tokens, out_features)](
-                x,
-                self.weight_proj,
-                out,
-                x.stride(0),
-                in_features,
-                out_features,
-                triton.next_power_of_2(in_features),
-                num_warps=4,
-            )
-            return out
         return nn.functional.linear(x, self.weight_proj)
 
     def forward(

@@ -14,12 +14,15 @@ from typing import TYPE_CHECKING
 import torch
 
 import vllm.envs as envs
+from vllm.model_executor.layers.fused_moe.moe_align_block_size import (
+    moe_align_block_size,
+)
 from vllm.triton_utils import tl, triton
 
 from .activation import _situ
 from .linear import k_group_partials
 from .moe import _load_bias, _local_experts, _select_experts
-from .sm80 import _align_indexed_experts, humming_decode_tuning
+from .sm80 import humming_decode_tuning
 
 if TYPE_CHECKING:
     from vllm.utils.humming import HummingInputSchema
@@ -308,7 +311,9 @@ class HummingExperts:
         )
         block_m = {name: self._block_m(name, valid_rows) for name in ("w13", "w2")}
         alignments = {
-            size: _align_indexed_experts(ids, size, self.num_experts)
+            size: moe_align_block_size(
+                ids, size, self.num_experts, ignore_invalid_experts=True
+            )[:3]
             for size in set(block_m.values())
         }
         gate_up = self._gemm(
