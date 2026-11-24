@@ -1958,7 +1958,8 @@ class EngineArgs:
             dest="gdn_prefill_backend",
             choices=["flashinfer", "triton", "cutedsl", "aiter_flydsl", "sycl", "hip"],
             default=None,
-            help="Select GDN prefill backend.",
+            help="Select the GDN prefill backend. On SM80 (A100), flashinfer is "
+            "opt-in and requires 128-dimensional key and value heads.",
         )
         parser.add_argument(
             "--kda-prefill-backend",

@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
@@ -20,6 +22,7 @@ from vllm.model_executor.layers.mamba.checkpoint import (  # noqa: E402
     MambaPrefillCheckpointMetadata,
 )
 from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
+    _resolve_gdn_prefill_backend,
     fi_chunk_gated_delta_rule,
 )  # noqa: E402
 from vllm.v1.attention.backends.gdn_attn import (  # noqa: E402
@@ -63,13 +66,42 @@ def test_flashinfer_gdn_prefill_passes_cu_seqlens_through(monkeypatch):
     assert final_state is None
 
 
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="CUDA backend selection")
+@pytest.mark.parametrize(
+    ("requested", "value_dim", "expected"),
+    [
+        ("auto", 128, "triton"),
+        ("flashinfer", 128, "flashinfer"),
+        ("flashinfer", 64, "triton"),
+    ],
+)
+def test_sm80_flashinfer_prefill_is_opt_in(monkeypatch, requested, value_dim, expected):
+    from vllm.platforms.interface import DeviceCapability
+
+    monkeypatch.setattr(
+        type(current_platform),
+        "get_device_capability",
+        lambda *args, **kwargs: DeviceCapability(8, 0),
+    )
+    config = SimpleNamespace(
+        additional_config={"gdn_prefill_backend": requested},
+        model_config=SimpleNamespace(
+            hf_text_config=SimpleNamespace(
+                linear_key_head_dim=128, linear_value_head_dim=value_dim
+            )
+        ),
+    )
+    assert _resolve_gdn_prefill_backend(config)[1] == expected
+
+
 @pytest.mark.skipif(
     not (
-        current_platform.is_device_capability(90)
+        current_platform.is_device_capability(80)
+        or current_platform.is_device_capability(90)
         or current_platform.is_device_capability_family(100)
         or current_platform.is_device_capability_family(120)
     ),
-    reason="FlashInfer GDN prefill checkpoints need SM90, SM100 or SM120.",
+    reason="FlashInfer GDN prefill checkpoints need SM80, SM90, SM100 or SM120.",
 )
 @pytest.mark.parametrize("use_cp", [True, False])
 @pytest.mark.parametrize("ssm_dtype", [torch.float32, torch.bfloat16])
