@@ -17,6 +17,7 @@ holds for every replay of a CUDA graph.
 import torch
 
 from vllm.triton_utils import tl, triton
+from vllm.utils.platform_utils import get_device_name_as_file_name, num_compute_units
 
 from .e4m3 import _NATIVE_E4M3, _e4m3_f16, e4m3_arg
 
@@ -309,6 +310,21 @@ def rel_attention(
     else:
         assert out.is_contiguous() and lse.is_contiguous()
         out_strides = (0, 0, 0, 0)
+    num_stages = 2
+    if (
+        mode == MODE_PARTIAL
+        and max_query_len == 1
+        and num_splits == 3
+        and window == extent == 1024
+        and head_dim == 128
+        and group == 3
+        and num_kv_heads in (4, 8)
+        and page == 64
+        and q.dtype == key_cache.dtype == value_cache.dtype == torch.bfloat16
+        and get_device_name_as_file_name(q.get_device()) == "NVIDIA_A100_80GB_PCIe"
+        and num_compute_units(q.get_device()) == 108
+    ):
+        num_stages = 3
     _rel_attention_kernel[grid](
         q,
         e4m3_arg(key_cache),
@@ -345,5 +361,5 @@ def rel_attention(
         BLOCK_M=block_m,
         BLOCK_N=64 if block_m >= 128 else 128 if block_m <= 32 else 64,
         num_warps=8 if block_m >= 128 else 4,
-        num_stages=2,
+        num_stages=num_stages,
     )
