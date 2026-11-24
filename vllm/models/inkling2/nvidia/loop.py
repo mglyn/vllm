@@ -17,7 +17,9 @@ from collections.abc import Sequence
 import torch
 from torch import nn
 
+from vllm import envs
 from vllm.distributed import tensor_model_parallel_all_reduce
+from vllm.utils.platform_utils import get_device_name_as_file_name, num_compute_units
 
 from ..configs import Inkling2ModelConfig
 from ..quant_config import Inkling2QuantConfig
@@ -28,7 +30,12 @@ from .model import (
 )
 from .ops.attn_res import attn_res
 from .ops.linear import linear_k_groups
-from .ops.ll_gemm_sm120 import sm12x_bf16_ll_gemm, use_sm12x_bf16_ll_gemm
+from .ops.ll_gemm_sm120 import MAX_M as LL_GEMM_MAX_M
+from .ops.ll_gemm_sm120 import (
+    sm12x_bf16_ll_gemm,
+    sm80_bf16_loop_down,
+    use_sm12x_bf16_ll_gemm,
+)
 from .ops.loop import blend_rms_norm, pair_rms_norm
 from .sconv import conv_metadata
 
@@ -128,7 +135,17 @@ class Inkling2LoopDecoderLayer(Inkling2DecoderLayer):
             hidden = sm12x_bf16_ll_gemm(pair, down)
             gain_forget = sm12x_bf16_ll_gemm(hidden, up, out_dtype=torch.float32)
         else:
-            hidden = torch.bmm(pair, down.transpose(1, 2))
+            if (
+                down.shape == (3, 64, 4608)
+                and 1 < pair.shape[1] <= LL_GEMM_MAX_M
+                and not envs.VLLM_BATCH_INVARIANT
+                and get_device_name_as_file_name(pair.get_device())
+                == "NVIDIA_A100_80GB_PCIe"
+                and num_compute_units(pair.get_device()) == 108
+            ):
+                hidden = sm80_bf16_loop_down(pair, down)
+            else:
+                hidden = torch.bmm(pair, down.transpose(1, 2))
             gain_forget = torch.bmm(hidden, up.transpose(1, 2), out_dtype=torch.float32)
         return blend_rms_norm(dest, message, gain_forget, norm_weight, norm_eps)
 

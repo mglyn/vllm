@@ -13,6 +13,9 @@ from vllm.triton_utils import tl, triton
 from vllm.utils.platform_utils import num_compute_units
 from vllm.utils.torch_utils import current_stream
 
+from . import use_pdl
+from .pdl import gdc_launch_dependents, gdc_wait
+
 MAX_M = 16
 _MP = 16
 _MAX_TILES = 4096
@@ -45,7 +48,7 @@ def _ll_gemm_kernel(
     `s`. With `SPLIT > 1` it writes fp32 partials to `P` `[SPLIT, B, MP, N]`;
     the last of the tile's programs to finish (counted in `C`, reset to 0
     after) sums them in split order, so results are deterministic."""
-    tl.extra.cuda.gdc_wait()
+    gdc_wait()
     pid_n = tl.program_id(0)
     b = tl.program_id(1)
     s = tl.program_id(2)
@@ -90,7 +93,7 @@ def _ll_gemm_kernel(
             acc.to(Y.dtype.element_ty),
             (rows[:, None] < M) & (cols[None, :] < N),
         )
-    tl.extra.cuda.gdc_launch_dependents()
+    gdc_launch_dependents()
 
 
 @triton.jit
@@ -237,7 +240,7 @@ def _ll_gemm(
         MP=_MP,
         num_warps=cfg.num_warps,
         num_stages=cfg.num_stages,
-        launch_pdl=True,
+        launch_pdl=use_pdl(),
     )
 
 
@@ -330,6 +333,12 @@ def sm12x_bf16_ll_gemm(
     if x2.shape[0]:
         _ll_gemm(x2[None], weight[None], bias, out[None])
     return out.view(*lead, n)
+
+
+def sm80_bf16_loop_down(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    out = x.new_empty((*x.shape[:2], weight.shape[1]))
+    _ll_gemm(x, weight, None, out)
+    return out
 
 
 def use_sm12x_bf16_ll_gemm(
