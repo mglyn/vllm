@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Inkling2 relative-bias paged attention for Hopper and SM12x (Triton).
+"""Inkling2 relative-bias paged attention (Triton).
 
 Stands in for tml_fa4 (prefill) and the tcgen05 decode/verify kernel of
 `ops/attention.py`, reading the same sheared relative logits of
@@ -19,6 +19,7 @@ import torch
 from vllm.triton_utils import tl, triton
 
 from .e4m3 import _NATIVE_E4M3, _e4m3_f16, e4m3_arg
+from .sm80 import use_three_stage_attention
 
 # The query tile of tml_fa4 that shears the relative logits.
 _SHEAR_TILE = tl.constexpr(128)
@@ -309,6 +310,11 @@ def rel_attention(
     else:
         assert out.is_contiguous() and lse.is_contiguous()
         out_strides = (0, 0, 0, 0)
+    num_stages = 2
+    if mode == MODE_PARTIAL and use_three_stage_attention(
+        q, key_cache, value_cache, max_query_len, num_splits, window, extent
+    ):
+        num_stages = 3
     _rel_attention_kernel[grid](
         q,
         e4m3_arg(key_cache),
@@ -345,5 +351,5 @@ def rel_attention(
         BLOCK_M=block_m,
         BLOCK_N=64 if block_m >= 128 else 128 if block_m <= 32 else 64,
         num_warps=8 if block_m >= 128 else 4,
-        num_stages=2,
+        num_stages=num_stages,
     )

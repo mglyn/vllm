@@ -1,7 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Low-M BF16 tensor-core projections for SM120/SM121: batched `x @ w.T` with
-deterministic split-K for narrow outputs, and a grouped q/k/v projection."""
+"""Low-M BF16 tensor-core projections for Inkling 2.
+
+SM12x and SM80 share the grouped QKV and deterministic split-K kernels.
+The SM80 split-K entry point serves the loop down projection.
+"""
 
 import functools
 from typing import NamedTuple
@@ -40,12 +43,14 @@ def _ll_gemm_kernel(
     K_PER_SPLIT: tl.constexpr,
     SPLIT: tl.constexpr,
     MP: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
 ):
     """Program `(n, b, s)` computes column tile `n` of batch `b` over K range
     `s`. With `SPLIT > 1` it writes fp32 partials to `P` `[SPLIT, B, MP, N]`;
     the last of the tile's programs to finish (counted in `C`, reset to 0
     after) sums them in split order, so results are deterministic."""
-    tl.extra.cuda.gdc_wait()
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
     pid_n = tl.program_id(0)
     b = tl.program_id(1)
     s = tl.program_id(2)
@@ -90,7 +95,8 @@ def _ll_gemm_kernel(
             acc.to(Y.dtype.element_ty),
             (rows[:, None] < M) & (cols[None, :] < N),
         )
-    tl.extra.cuda.gdc_launch_dependents()
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
 
 
 @triton.jit
@@ -124,11 +130,13 @@ def _qkv_bmm_kernel(
     BN: tl.constexpr,
     BK: tl.constexpr,
     MP: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
 ):
     """Columns `[0, S1)` of `Y` are `XQ @ W.T`, `[S1, S2)` `XK` and `[S2, N)`
     `XV`. A tile spanning a boundary runs both inputs' dots and picks per
     column (the second input's loads hit L2)."""
-    tl.extra.cuda.gdc_wait()
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
     n0 = tl.program_id(0) * BN
     n1 = tl.minimum(n0 + BN, N) - 1
     b_lo = (n0 >= S1).to(tl.int32) + (n0 >= S2).to(tl.int32)
@@ -159,7 +167,8 @@ def _qkv_bmm_kernel(
         acc.to(Y.dtype.element_ty),
         (rows[:, None] < M) & (cols[None, :] < N),
     )
-    tl.extra.cuda.gdc_launch_dependents()
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
 
 
 class _Config(NamedTuple):
@@ -196,7 +205,12 @@ def _counter(stream: int) -> torch.Tensor:
 
 
 def _ll_gemm(
-    x: torch.Tensor, w: torch.Tensor, bias: torch.Tensor | None, out: torch.Tensor
+    x: torch.Tensor,
+    w: torch.Tensor,
+    bias: torch.Tensor | None,
+    out: torch.Tensor,
+    *,
+    enable_pdl: bool = True,
 ) -> None:
     nb, m, k = x.shape
     n = w.shape[1]
@@ -235,16 +249,17 @@ def _ll_gemm(
         K_PER_SPLIT=cfg.k_per_split,
         SPLIT=cfg.split,
         MP=_MP,
+        ENABLE_PDL=enable_pdl,
         num_warps=cfg.num_warps,
         num_stages=cfg.num_stages,
-        launch_pdl=True,
+        launch_pdl=enable_pdl,
     )
 
 
 def use_qkv_bmm(
     x_q: torch.Tensor, x_k: torch.Tensor, x_v: torch.Tensor, w: torch.Tensor
 ) -> bool:
-    """Whether `qkv_bmm` serves bf16 `x_q`, `x_k`, `x_v` `[M, K]` and `w`."""
+    """Whether the operands fit the grouped QKV kernel layout."""
     return (
         x_q.is_cuda
         and x_q.ndim == 2
@@ -252,7 +267,6 @@ def use_qkv_bmm(
         and x_q.shape == x_k.shape == x_v.shape
         and x_q.dtype == x_k.dtype == x_v.dtype == w.dtype == torch.bfloat16
         and x_q.stride(1) == x_k.stride(1) == x_v.stride(1) == w.stride(1) == 1
-        and current_platform.is_device_capability_family(120)
     )
 
 
@@ -263,6 +277,8 @@ def qkv_bmm(
     w: torch.Tensor,
     k_start: int,
     v_start: int,
+    *,
+    enable_pdl: bool = True,
 ) -> torch.Tensor:
     """One launch of three linears on consecutive row ranges of `w` `[N, K]`:
     output columns `[0, k_start)` from `x_q`, `[k_start, v_start)` from `x_k`
@@ -275,11 +291,10 @@ def qkv_bmm(
     bn = 32
     assert 0 < m <= MAX_M and w.shape == (n, k)
     assert all(x.shape == (m, k) and x.stride(1) == 1 for x in xs)
-    assert w.stride(1) == 1 and s1 > 0 and s1 + bn <= s2 <= n  # one boundary per tile
+    assert w.stride(1) == 1 and s1 >= 0 and s1 + bn <= s2 <= n  # one boundary per tile
     assert max(n * w.stride(0), *(m * x.stride(0) for x in xs)) < 2**31
     out = torch.empty((m, n), dtype=x_q.dtype, device=x_q.device)
-    # About 1.6 waves of 32-column tiles at Inkling's 8608 columns; wider
-    # tiles or split-K measured no faster.
+    # Use 32-column tiles for the grouped projection on both architectures.
     _qkv_bmm_kernel[(triton.cdiv(n, bn),)](
         x_q,
         x_k,
@@ -301,7 +316,8 @@ def qkv_bmm(
         MP=_MP,
         num_warps=4,
         num_stages=4,
-        launch_pdl=True,
+        ENABLE_PDL=enable_pdl,
+        launch_pdl=enable_pdl,
     )
     return out
 

@@ -28,8 +28,12 @@ from .model import (
 )
 from .ops.attn_res import attn_res
 from .ops.linear import linear_k_groups
-from .ops.ll_gemm_sm120 import sm12x_bf16_ll_gemm, use_sm12x_bf16_ll_gemm
+from .ops.ll_gemm_sm120 import (
+    sm12x_bf16_ll_gemm,
+    use_sm12x_bf16_ll_gemm,
+)
 from .ops.loop import blend_rms_norm, pair_rms_norm
+from .ops.sm80 import sm80_bf16_loop_down, use_loop_down
 from .sconv import conv_metadata
 
 LOOP_STREAMS = ("attn", "k", "v", "mlp")
@@ -128,7 +132,10 @@ class Inkling2LoopDecoderLayer(Inkling2DecoderLayer):
             hidden = sm12x_bf16_ll_gemm(pair, down)
             gain_forget = sm12x_bf16_ll_gemm(hidden, up, out_dtype=torch.float32)
         else:
-            hidden = torch.bmm(pair, down.transpose(1, 2))
+            if use_loop_down(pair, down):
+                hidden = sm80_bf16_loop_down(pair, down)
+            else:
+                hidden = torch.bmm(pair, down.transpose(1, 2))
             gain_forget = torch.bmm(hidden, up.transpose(1, 2), out_dtype=torch.float32)
         return blend_rms_norm(dest, message, gain_forget, norm_weight, norm_eps)
 
