@@ -17,6 +17,7 @@ import vllm.envs as envs
 from vllm.model_executor.layers.fused_moe.moe_align_block_size import (
     moe_align_block_size,
 )
+from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 
 from .activation import _situ
@@ -190,6 +191,7 @@ class HummingExperts:
         self.tensors: dict[str, dict[str, torch.Tensor]] = {}
         self.tunings: dict[str, list] = {}
         self.tuning_strs: dict[str, str] = {}
+        self.sm80_decode_tuning: dict[tuple[str, int], str] = {}
         for name, (n, k) in zip(("w13", "w2"), shapes):
             weight, scale, global_scale = weights[name]
             num_experts = weight.shape[0]
@@ -233,6 +235,34 @@ class HummingExperts:
             self.tensors[name] = tensors
             self.tunings[name] = tuning
             self.tuning_strs[name] = json.dumps(tuning)
+            if (
+                nvfp4
+                and input_schema is None
+                and shapes == ((2304, 2304), (2304, 1152))
+                and num_experts in (64, 128)
+                and weight.is_cuda
+                and not envs.VLLM_BATCH_INVARIANT
+                and current_platform.is_device_capability(
+                    80, device_id=weight.get_device()
+                )
+            ):
+                # On full A100, two CTAs hide the decode weight-load latency
+                # for 5–8 tokens. Keep the stock block size and K reduction.
+                for tokens in range(5, 9):
+                    rows = tokens * 8 * num_experts // 128
+                    for lower, upper, schedule in tuning:
+                        if (
+                            lower < rows <= upper
+                            and tuple(schedule["block_shape"])
+                            in ((8, 256, 64), (8, 256, 128))
+                            and schedule.get("num_ctas_per_sm") == 1
+                            and schedule.get("num_sms") == 108
+                            and schedule.get("num_stages") in (4, 5)
+                        ):
+                            self.sm80_decode_tuning[name, rows] = json.dumps(
+                                dict(schedule, num_ctas_per_sm=2, num_stages=4)
+                            )
+                            break
         self.num_experts = num_experts
         self.compute_config = json.dumps(
             {
@@ -257,6 +287,7 @@ class HummingExperts:
         alignment: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
         top_k: int,
         valid_rows: int,
+        tuning_config: str | None = None,
     ) -> torch.Tensor:
         from vllm.utils.humming import humming_forward
 
@@ -280,7 +311,7 @@ class HummingExperts:
             top_k=top_k,
             valid_shape_m=valid_rows,
             compute_config=self.compute_config,
-            tuning_config=self.tuning_strs[name],
+            tuning_config=tuning_config or self.tuning_strs[name],
         )
 
     def __call__(
@@ -299,6 +330,9 @@ class HummingExperts:
         rows = tokens * topk
         # Expected local rows, which pick the kernel configs.
         valid_rows = -(-rows * self.num_experts // num_global_experts)
+        tuned = (
+            self.sm80_decode_tuning if num_global_experts == 128 and topk == 8 else {}
+        )
         block_m = {name: self._block_m(name, valid_rows) for name in ("w13", "w2")}
         alignments = {
             size: moe_align_block_size(
@@ -307,10 +341,22 @@ class HummingExperts:
             for size in set(block_m.values())
         }
         gate_up = self._gemm(
-            "w13", x, rows, alignments[block_m["w13"]], topk, valid_rows
+            "w13",
+            x,
+            rows,
+            alignments[block_m["w13"]],
+            topk,
+            valid_rows,
+            tuned.get(("w13", valid_rows)),
         )
         activated = swiglu(gate_up, weights, src2dst, gate_cap, up_cap)
         del gate_up
         return self._gemm(
-            "w2", activated, rows, alignments[block_m["w2"]], 1, valid_rows
+            "w2",
+            activated,
+            rows,
+            alignments[block_m["w2"]],
+            1,
+            valid_rows,
+            tuned.get(("w2", valid_rows)),
         )
