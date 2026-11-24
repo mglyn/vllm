@@ -128,10 +128,12 @@ def _k_group_kernel(
     BM: tl.constexpr,
     BN: tl.constexpr,
     SPLIT: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
 ):
     if SPLIT and tl.program_id(1) == 0:
         _prefetch_k_group_tile(W, N, K, BN, tl.program_id(0), tl.program_id(2))
-    tl.extra.cuda.gdc_wait()
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
     _k_group_tile(
         X,
         W,
@@ -149,8 +151,11 @@ def _k_group_kernel(
 
 
 @triton.jit
-def _k_group_sum_kernel(Partials, Y, MN, GROUPS: tl.constexpr, BLOCK: tl.constexpr):
-    tl.extra.cuda.gdc_wait()
+def _k_group_sum_kernel(
+    Partials, Y, MN, GROUPS: tl.constexpr, BLOCK: tl.constexpr, ENABLE_PDL: tl.constexpr
+):
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
     offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     mask = offs < MN
     total = tl.load(Partials + offs, mask)
@@ -214,7 +219,8 @@ def k_group_partials(
     tokens, hidden = x.shape
     n = weight.shape[0]
     sm120 = current_platform.is_device_capability_family(120)
-    if tokens >= TMA_MIN_TOKENS:
+    enable_pdl = current_platform.has_device_capability(90, device_id=x.get_device())
+    if enable_pdl and tokens >= TMA_MIN_TOKENS:
         from triton.tools.tensor_descriptor import TensorDescriptor
 
         out = torch.empty((1, tokens, n), dtype=out_dtype, device=x.device)
@@ -265,10 +271,11 @@ def k_group_partials(
         block_m,
         block_n,
         split,
+        enable_pdl,
         num_warps=num_warps,
         num_stages=num_stages,
         enable_fp_fusion=False,
-        launch_pdl=True,
+        launch_pdl=enable_pdl,
     )
     return out
 
@@ -285,7 +292,14 @@ def linear_k_groups(
     if partials.shape[0] == 1:
         return partials[0]
     out = torch.empty(partials.shape[1:], dtype=out_dtype, device=x.device)
+    enable_pdl = current_platform.has_device_capability(90, device_id=x.get_device())
     _k_group_sum_kernel[(triton.cdiv(out.numel(), 1024),)](
-        partials, out, out.numel(), partials.shape[0], 1024, launch_pdl=True
+        partials,
+        out,
+        out.numel(),
+        partials.shape[0],
+        1024,
+        enable_pdl,
+        launch_pdl=enable_pdl,
     )
     return out

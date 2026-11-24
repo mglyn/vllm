@@ -387,6 +387,38 @@ def test_short_conv_chunked_matches_full_sequence(fused_residual, steps):
         torch.testing.assert_close(torch.cat(outs[i]), ref, atol=0, rtol=1e-2)
 
 
+@pytest.mark.skipif(
+    not current_platform.is_device_capability(80), reason="SM80 prefill fallback"
+)
+def test_sm80_short_conv_keeps_history_in_padded_prefill_tile():
+    """The last live request continues from cached inputs even if its tile is padded."""
+    block, width = 4, 128
+    cache, table = _conv_cache_and_table(1, block, width, blocks_per_req=80)
+    initial, continued = _chunked_steps([[0, 4], [260, 2]], table, block)
+    weight = torch.ones(width, 4, device=DEVICE, dtype=torch.bfloat16)
+    history = weight.new_full((4, width), 2)
+    short_conv(history, weight, cache, *initial[-1], 0, width)
+    positions, table, seq_idx, slots, starts = continued[-1]
+    live = positions.numel()
+    inputs = weight.new_full((live + 2, width), 2)
+    inputs[live:] = 0
+    pad = torch.nn.functional.pad
+    out = short_conv(
+        inputs,
+        weight,
+        cache,
+        pad(positions, (0, 2)),
+        table,
+        pad(seq_idx, (0, 2)),
+        pad(slots, (0, 2), value=-1),
+        pad(starts, (0, 2)),
+        0,
+        width,
+    )
+    expected = _dense_conv(torch.cat([history, inputs[live - 2 : live]]), weight, None)
+    torch.testing.assert_close(out[live - 2 : live], expected[-2:], rtol=0, atol=0)
+
+
 @pytest.mark.parametrize(
     "num_stack,num_q,with_last,with_residual",
     [
@@ -547,7 +579,11 @@ def test_attention_prologue_writes_clipped_k_and_normed_v(dynamic, split, monkey
     assert (cache[..., : 2 * dim] != 0).any(-1).sum() == num_tokens * heads
 
 
-@pytest.mark.parametrize("cache_dtype", [torch.float16, torch.float8_e4m3fn])
+@pytest.mark.parametrize(
+    "cache_dtype",
+    [torch.float16]
+    + ([torch.float8_e4m3fn] if current_platform.has_device_capability(89) else []),
+)
 def test_attention_prologue_stores_low_precision_kv_without_touching_padding(
     cache_dtype,
 ):

@@ -16,11 +16,12 @@ from vllm.models.inkling2.nvidia.vision import (
     _PROCESSOR_CLIP_STD,
     Inkling2VisionEncoder,
 )
+from vllm.platforms import current_platform
 
+_cap = current_platform.get_device_capability() if current_platform.is_cuda() else None
 pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available()
-    or torch.cuda.get_device_capability()[0] not in (9, 10, 12),
-    reason="needs a Hopper or Blackwell GPU",
+    _cap is None or (_cap != (8, 0) and _cap.major not in (9, 10, 12)),
+    reason="needs an SM80, Hopper, or Blackwell GPU",
 )
 
 CONFIG = {

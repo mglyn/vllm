@@ -44,6 +44,7 @@ from vllm.model_executor.models.utils import (
 )
 from vllm.models.inkling.nvidia.sconv_swa_attn import InklingConvState
 from vllm.multimodal import MULTIMODAL_REGISTRY
+from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.v1.worker.encoder_cudagraph_defs import (
     EncoderCudaGraphCaptureInputs,
@@ -550,6 +551,11 @@ class Inkling2ForConditionalGeneration(
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__()
         config: Inkling2MMConfig = vllm_config.model_config.hf_config
+        if (
+            current_platform.is_device_capability(80)
+            and config.text_config.loop_config is None
+        ):
+            raise ValueError("Inkling 2 on SM80 requires a looped checkpoint")
         quant_config = vllm_config.quant_config
         assert quant_config is None or isinstance(quant_config, Inkling2QuantConfig)
         assert vllm_config.parallel_config.pipeline_parallel_size == 1

@@ -18,6 +18,7 @@ from vllm.model_executor.layers.quantization.base_config import (
     QuantizeMethodBase,
 )
 from vllm.models.inkling2.configs import INKLING2_ARCHITECTURES
+from vllm.platforms import current_platform
 
 _COMPUTE_DTYPES = ("float32", "bfloat16", "mxfp8", "nvfp4")
 
@@ -43,7 +44,7 @@ class Inkling2QuantConfig(QuantizationConfig):
 
     @classmethod
     def get_min_capability(cls) -> int:
-        return 90
+        return 80 if current_platform.is_device_capability(80) else 90
 
     @staticmethod
     def get_config_filenames() -> list[str]:

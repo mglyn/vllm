@@ -91,7 +91,11 @@ class Inkling2VisionAttention(nn.Module):
         else:
             from vllm.vllm_flash_attn import flash_attn_varlen_func
 
-            version = 2 if current_platform.is_device_capability_family(120) else 3
+            device_id = q.get_device()
+            use_fa2 = current_platform.is_device_capability(
+                80, device_id=device_id
+            ) or current_platform.is_device_capability_family(120, device_id=device_id)
+            version = 2 if use_fa2 else 3
             out = flash_attn_varlen_func(q, k, v, fa_version=version, **kwargs)
         return self.out_proj(out.view(hidden.shape))
 

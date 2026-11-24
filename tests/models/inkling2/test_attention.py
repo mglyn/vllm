@@ -19,6 +19,10 @@ requires_sm90 = pytest.mark.skipif(
     _cap is None or _cap.major not in (9, 10, 11, 12),
     reason="Inkling2 attention requires Hopper or Blackwell",
 )
+requires_bf16_attention = pytest.mark.skipif(
+    _cap is None or (_cap != (8, 0) and _cap.major not in (9, 10, 11, 12)),
+    reason="Inkling2 BF16 attention requires SM80, Hopper, or Blackwell",
+)
 
 HEAD_DIM = 128
 REL_EXTENT = 1024
@@ -172,7 +176,7 @@ def test_portable_attention_dequantizes_kv_before_mma(
         torch.testing.assert_close(observed, reference, atol=0, rtol=0)
 
 
-@requires_sm90
+@requires_bf16_attention
 @pytest.mark.parametrize(
     "num_heads,num_kv_heads,block_size,window_left,scenario",
     [
@@ -292,7 +296,7 @@ def test_inkling2_rel_attention(
     torch.testing.assert_close(lse, ref_lse, atol=1e-4, rtol=1e-5)
 
 
-@requires_sm90
+@requires_bf16_attention
 @pytest.mark.parametrize(
     "num_heads,num_kv_heads,window_left",
     [
@@ -386,7 +390,7 @@ def test_inkling2_rel_decode_attention(
     assert (out[num_tokens:] == 0).all()
 
 
-@requires_sm90
+@requires_bf16_attention
 @pytest.mark.parametrize("is_local", [False, True])
 @pytest.mark.parametrize("num_splits", [1, 9])
 @torch.inference_mode()

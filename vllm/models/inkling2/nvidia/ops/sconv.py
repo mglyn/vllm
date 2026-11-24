@@ -25,6 +25,7 @@ RMS-normalizes V per head and writes both to the paged KV cache.
 import torch
 
 from vllm.models.inkling2.nvidia.ops.norm import qr_clip_rel_tokens, rsqrt
+from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 
 
@@ -331,11 +332,13 @@ def _sconv_kernel(
     BT: tl.constexpr,
     BLOCK_C: tl.constexpr,
     SKIP_IDLE_CACHE: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
 ):
     first = tl.program_id(0) * BT
     tile_reads_cache = True
     if SKIP_IDLE_CACHE:
-        tl.extra.cuda.gdc_wait()
+        if ENABLE_PDL:
+            tl.extra.cuda.gdc_wait()
         # Request starts are non-decreasing: no token of the tile is among the
         # first W - 1 of its request unless the last token's request starts
         # after first - (W - 1).
@@ -371,7 +374,7 @@ def _sconv_kernel(
         c_mask,
         W,
         SKIP_IDLE_CACHE=SKIP_IDLE_CACHE,
-        CACHE_FIRST=not SKIP_IDLE_CACHE,
+        CACHE_FIRST=ENABLE_PDL and not SKIP_IDLE_CACHE,
         tile_reads_cache=tile_reads_cache,
     ).to(out_ptr.dtype.element_ty)
     offs = toff[:, None] * C + coff[None, :]
@@ -424,6 +427,10 @@ def short_conv(
         block_t, block_c = (4, 256) if prefill else (2, 512)
     block_c = min(triton.next_power_of_2(channels), block_c)
     grid = (triton.cdiv(num_tokens, block_t), triton.cdiv(channels, block_c))
+    enable_pdl = current_platform.has_device_capability(90, device_id=x.get_device())
+    # A padded prefill tile can end with a zero request start. Check the
+    # cache per token in the SM80 fallback.
+    skip_idle_cache = prefill and enable_pdl
     _sconv_kernel[grid](
         x,
         cache,
@@ -455,10 +462,11 @@ def short_conv(
         HAS_ADDEND=addend is not None,
         BT=block_t,
         BLOCK_C=block_c,
-        SKIP_IDLE_CACHE=prefill,
+        SKIP_IDLE_CACHE=skip_idle_cache,
+        ENABLE_PDL=enable_pdl,
         num_warps=4,
         enable_fp_fusion=False,
-        launch_pdl=True,
+        launch_pdl=enable_pdl,
     )
     return out
 
@@ -553,10 +561,12 @@ def _attn_prologue_kernel(
     BLOCK_E: tl.constexpr,
     QR_TOKENS: tl.constexpr,
     FUSE_QR: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
 ):
-    tl.extra.cuda.gdc_wait()
-    # The decode attention kernel prefetches cached keys meanwhile.
-    tl.extra.cuda.gdc_launch_dependents()
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
+        # The decode attention kernel prefetches cached keys meanwhile.
+        tl.extra.cuda.gdc_launch_dependents()
     # Programs (tile, head, 0 | 1) run the K | V conv of one KV head; programs
     # (tile, head, 2) clip q of QR_TOKENS of the tile's tokens and programs
     # (tile, head, 3 + c) their r and column block c of the relative logits.
@@ -665,6 +675,7 @@ def _qr_rel_kernel(
     BLOCK_HQ: tl.constexpr,
     BLOCK_E: tl.constexpr,
     QR_TOKENS: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
 ):
     # Runs alongside the K/V conv launch (`_attn_prologue_kernel` without
     # FUSE_QR), which started it after its own grid dependency wait; waiting
@@ -700,7 +711,8 @@ def _qr_rel_kernel(
         BLOCK_HQ,
         BLOCK_E,
     )
-    tl.extra.cuda.gdc_wait()
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
 
 
 @triton.jit
@@ -910,6 +922,7 @@ def attention_prologue(
     block_t = _prologue_block_t(num_tokens)
     qr_tokens = _prologue_qr_tokens(num_tokens)
     qr_blocks = 1 + (extent + 256) // block_e
+    enable_pdl = current_platform.has_device_capability(90, device_id=q.get_device())
     grid = (
         triton.cdiv(num_tokens, block_t),
         num_heads,
@@ -978,9 +991,10 @@ def attention_prologue(
         BLOCK_E=block_e,
         QR_TOKENS=triton.cdiv(block_t, num_heads),
         FUSE_QR=not qr_tokens,
+        ENABLE_PDL=enable_pdl,
         num_warps=4,
         enable_fp_fusion=False,
-        launch_pdl=True,
+        launch_pdl=enable_pdl,
     )
     if qr_tokens:
         _qr_rel_kernel[(triton.cdiv(num_tokens, qr_tokens), qr_blocks)](
@@ -1010,7 +1024,8 @@ def attention_prologue(
             BLOCK_HQ=max(triton.next_power_of_2(num_q_heads), 16),
             BLOCK_E=block_e,
             QR_TOKENS=qr_tokens,
+            ENABLE_PDL=enable_pdl,
             num_warps=4,
             enable_fp_fusion=False,
-            launch_pdl=True,
+            launch_pdl=enable_pdl,
         )
